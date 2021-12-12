@@ -335,6 +335,24 @@ class JigsawModel(nn.Module):
         
         return out  # returns the obtained values
 
+class MultiModel(nn.Module):  
+    def __init__(self, model_path, mode='severity'):  # initialization of the class at the input of the dataframe, tokenizer, max_length
+        # set the class attributes
+        super(MultiModel, self).__init__()
+        self.mode = mode
+        self.model = AutoModel.from_pretrained(model_path)
+        self.drop = nn.Dropout(p=0.2)
+        self.fc = nn.Linear(768, 6)
+        self.fc2 = nn.Linear(768, 1)
+        
+    def forward(self, ids, mask):        
+        out = self.model(input_ids=ids,attention_mask=mask,
+                         output_hidden_states=False)
+        out = self.drop(out[0])
+        out = self.fc(out)
+
+        return (self.fc(out), self.fc2(out))  # returns the obtained values
+
 
 # ## Severity
 # ## Train
@@ -388,6 +406,7 @@ def train_severity_one_epoch(model, criterion, optimizer, scheduler, dataloader,
     gc.collect()
     
     return epoch_loss  # returns the result of the training function for one epoch
+
 
 
 # ### Validate
@@ -496,14 +515,94 @@ def train_contrastive_one_epoch(model, criterion, optimizer, scheduler, dataload
     
     return epoch_loss  # returns the result of the training function for one epoch
 
+def train_multi_one_epoch(model, criterion, optimizer, scheduler, dataloader, device, epoch):  
+    # one epoch training function
+    sev_criterion, con_criterion = criterion
+    sev_dataloader, con_dataloader = dataloader
+    
+    model.train()
+    
+    dataset_size = 0
+    running_loss = 0.0
+    epoch_loss = 0.0
+    
+    length = min(len(sev_dataloader), len(con_dataloader))
+    
+    bar = tqdm(range(length // CONFIG["train_batch_size"]))
+    
+    sev_enum = enumerate(sev_dataloader)
+    con_enum = enumerate(con_dataloader)
+    
+    accs = []
+    
+    
+    for step in bar:
+        try:
+            data = next(sev_enum)
+        except:
+            break
+        ids = data['ids'].to(device, dtype = torch.long)
+        mask = data['mask'].to(device, dtype = torch.long)
+        targets = data['target'].to(device, dtype=torch.long)
+       
+        try:
+            data = next(con_enum)
+        except:
+            more_toxic_ids = data['more_toxic_ids'].to(device, dtype = torch.long)
+            more_toxic_mask = data['more_toxic_mask'].to(device, dtype = torch.long)
+            less_toxic_ids = data['less_toxic_ids'].to(device, dtype = torch.long)
+            less_toxic_mask = data['less_toxic_mask'].to(device, dtype = torch.long)
+            con_targets = data['target'].to(device, dtype=torch.long)        
+        
+        
+        batch_size = ids.size(0)
 
+        outputs_sev, _ = model(ids, mask)
+        
+        loss_sev = sev_criterion(outputs_sev, targets)
+        
+        more_toxic_outputs = model(more_toxic_ids, more_toxic_mask)
+        less_toxic_outputs = model(less_toxic_ids, less_toxic_mask)
+        
+        loss_con = con_criterion(more_toxic_outputs, less_toxic_outputs, con_targets)
+        loss = loss_sev + loss_con
+        
+        accs.extend(list(np.array( (more_toxic_outputs > less_toxic_outputs).int().view(-1).detach().cpu()       )))
+        
+        
+        loss = loss / CONFIG['n_accumulate']
+        loss.backward()
+    
+        if (step + 1) % CONFIG['n_accumulate'] == 0:
+            optimizer.step()
+
+            # zero the parameter gradients
+            optimizer.zero_grad()
+
+            if scheduler is not None:
+                scheduler.step()
+                
+        running_loss += (loss.item() * batch_size)
+        dataset_size += batch_size
+        
+        epoch_loss = running_loss / dataset_size
+        
+        bar.set_postfix(Epoch=epoch, Train_Loss=epoch_loss,
+                        LR=optimizer.param_groups[0]['lr'],acc=sum(accs)/len(accs))
+        if CONFIG['is_dev_run'] and step > 5:
+            # Break after one step
+            break
+    gc.collect()
+    
+    return epoch_loss  # returns the result of the training function for one epoch
+    
 # ### Validate 
 
 # In[40]:
 
 
 @torch.no_grad()
-def valid_contrastive_one_epoch(model, criterion, optimizer, dataloader, device, epoch):  # one epoch check function
+def valid_contrastive_one_epoch(model, criterion, optimizer, dataloader, device, epoch, multi=False):  # one epoch check function
     model.eval()
     
     dataset_size = 0
@@ -525,6 +624,10 @@ def valid_contrastive_one_epoch(model, criterion, optimizer, dataloader, device,
 
         more_toxic_outputs = model(more_toxic_ids, more_toxic_mask)
         less_toxic_outputs = model(less_toxic_ids, less_toxic_mask)
+        
+        if multi:
+            more_toxic_outputs=more_toxic_outputs[1]
+            less_toxic_outputs=less_toxic_outputs[1]
         
         loss = criterion(more_toxic_outputs, less_toxic_outputs, targets)
         
@@ -607,6 +710,10 @@ def run_training(model, optimizer, scheduler, device, num_epochs, train_loader, 
         train_fn = train_contrastive_one_epoch
         valid_fn = valid_contrastive_one_epoch
         criterion = criterion_contrastive
+    elif mode == 'multi':
+        train_fn = train_multi_one_epoch
+        valid_fn = valid_contrastive_one_epoch
+        criterion = (criterion_focal, criterion_contrastive)
     bar = range(1, num_epochs + 1)
     for epoch in bar: 
         #bar.set_description(f"Epoch-{epoch}")
@@ -653,6 +760,22 @@ def run_training(model, optimizer, scheduler, device, num_epochs, train_loader, 
 
 
 def prepare_loaders(df, fold, mode):
+    if mode == 'multi':
+        df_sev, df_con = df
+        df_sev = df_sev[df_sev.kfold != fold].reset_index(drop=True)
+        df_con_train = df_con[df_con.kfold != fold].reset_index(drop=True)
+        df_valid = df_con[df_con.kfold == fold].reset_index(drop=True)
+        sev_train_dataset = SeverityDataset(df_sev, tokenizer=CONFIG['tokenizer'], max_length=CONFIG['max_length'])
+        con_train_dataset = ContrastiveDataset(df_con_train, tokenizer=CONFIG['tokenizer'], max_length=CONFIG['max_length'])
+        valid_dataset = ContrastiveDataset(df_valid, tokenizer=CONFIG['tokenizer'], max_length=CONFIG['max_length'])
+        
+        sev_loader = DataLoader(sev_train_dataset, batch_size=CONFIG['train_batch_size'], 
+                              num_workers=2, shuffle=True, pin_memory=True, drop_last=True)
+        con_loader = DataLoader(con_train_dataset, batch_size=CONFIG['train_batch_size'], 
+                              num_workers=2, shuffle=True, pin_memory=True, drop_last=True)
+        valid_loader = DataLoader(valid_dataset, batch_size=CONFIG['valid_batch_size'], 
+                              num_workers=2, shuffle=False, pin_memory=True)
+        return ((sev_loader, con_loader), valid_loader)
     df_train = df[df.kfold != fold].reset_index(drop=True)
     df_valid = df[df.kfold == fold].reset_index(drop=True)
     if mode == 'severity':
@@ -699,8 +822,10 @@ def run_training_for_mode(mode, model=None):
         df = df_cc
     elif mode == 'contrastive':
         df = df_val
+    elif mode == 'multi':
+        df = (df_cc, df_val)
     train_loader, valid_loader = prepare_loaders(df, CONFIG['n_fold'] - 1, mode)
-    model = model or JigsawModel(CONFIG['model_path'])
+    model = model or MultiModel(CONFIG['model_path'])
     model.mode = mode
     model.to(CONFIG['device'])
 
@@ -736,7 +861,7 @@ def run_training_for_mode(mode, model=None):
 
 modes = [
     'contrastive',
-#     'severity',
+#     'multi',
 ]
 model = None
 for mode in modes:
